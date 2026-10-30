@@ -129,7 +129,7 @@ class VirtualBCIKeyboard:
     def __init__(
         self,
         confidence_threshold: float = 0.60,
-        cooldown_seconds: float = 1.0,
+        cooldown_seconds: float = 0.2,
         mapping: Optional[Dict[str, str]] = None,
         nav_mode: str = "LINEAR"
     ):

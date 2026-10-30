@@ -203,7 +203,7 @@ if "communicator" not in st.session_state:
 if "virtual_keyboard" not in st.session_state:
     st.session_state.virtual_keyboard = VirtualBCIKeyboard(
         confidence_threshold=0.60,
-        cooldown_seconds=1.0,
+        cooldown_seconds=0.2,
         nav_mode="ROW_COLUMN"
     )
 
@@ -214,6 +214,144 @@ def get_cached_bci_classifier(model_dir: str = "models") -> Optional[EEGClassifi
         return EEGClassifierSystem.load_saved_model(model_dir=model_dir)
     except Exception:
         return None
+
+@st.cache_resource(show_spinner=False)
+def get_cached_raw_and_events(file_path: str, run_id: int):
+    """Loads and caches the raw EDF recording and annotations in memory."""
+    return load_real_eeg_run(file_path, run_id)
+
+@st.cache_resource(show_spinner=False)
+def get_cached_synthetic_run():
+    """Generates and caches synthetic demo data in memory."""
+    return generate_synthetic_demo_run(duration_sec=90.0, random_seed=42)
+
+@st.cache_data(show_spinner=False)
+def get_cached_recording_metadata(file_path: str, run_id: int, is_synthetic: bool = False):
+    """Caches metadata extraction."""
+    if is_synthetic:
+        raw, events = get_cached_synthetic_run()
+        fp = "SYNTHETIC_SIMULATED_DEMO_RUN.edf"
+    else:
+        raw, events = get_cached_raw_and_events(file_path, run_id)
+        fp = file_path
+    return get_recording_metadata(raw=raw, run_id=run_id, file_path=fp, labelled_events=events)
+
+@st.cache_resource(show_spinner=False)
+def get_cached_preprocessed_raw(file_path: str, run_id: int, l_freq: float, h_freq: float, notch_freq: Optional[float] = None, is_synthetic: bool = False):
+    """Caches FIR bandpass/notch filtering to run exactly ONCE per file and passband."""
+    if is_synthetic:
+        raw, _ = get_cached_synthetic_run()
+    else:
+        raw, _ = get_cached_raw_and_events(file_path, run_id)
+    return preprocess_raw(raw, l_freq=l_freq, h_freq=h_freq, notch_freq=notch_freq, copy=True)
+
+@st.cache_resource(show_spinner=False)
+def get_cached_single_segment_plot(file_path: str, run_id: int, seg_idx: int, channel: str, apply_bp: bool, apply_notch: bool, is_synthetic: bool = False):
+    """Caches single-segment Matplotlib plot generation and basic metrics."""
+    if is_synthetic:
+        raw, events = get_cached_synthetic_run()
+    else:
+        raw, events = get_cached_raw_and_events(file_path, run_id)
+    ev = events[seg_idx]
+    t_raw, s_raw, _ = get_single_trial_signal(raw, ev["onset_sec"], ev["duration_sec"], channel)
+    s_filt = None
+    if apply_bp:
+        raw_filt = get_cached_preprocessed_raw(file_path, run_id, 8.0, 30.0, 60.0 if apply_notch else None, is_synthetic=is_synthetic)
+        _, s_filt, _ = get_single_trial_signal(raw_filt, ev["onset_sec"], ev["duration_sec"], channel)
+    fig = plot_single_segment_matplotlib(
+        time_array=t_raw,
+        raw_uv=s_raw,
+        filtered_uv=s_filt,
+        channel_name=channel,
+        task_label=ev["label"],
+        event_code=ev["code"],
+        is_synthetic=ev.get("is_synthetic", False)
+    )
+    p2p = float(np.ptp(s_raw))
+    rms = float(np.sqrt(np.mean(s_raw**2)))
+    std_val = float(np.std(s_raw))
+    return fig, p2p, rms, std_val
+
+@st.cache_resource(show_spinner=False)
+def get_cached_comparison_plot(file_path: str, run_id: int, channel: str, apply_bp: bool, is_synthetic: bool = False):
+    """Caches cross-task comparison Matplotlib plot."""
+    if is_synthetic:
+        raw, events = get_cached_synthetic_run()
+    else:
+        raw, events = get_cached_raw_and_events(file_path, run_id)
+    unique_tasks = {}
+    for ev in events:
+        if ev["label"] not in unique_tasks:
+            unique_tasks[ev["label"]] = ev
+    raw_filt = get_cached_preprocessed_raw(file_path, run_id, 8.0, 30.0, is_synthetic=is_synthetic) if apply_bp else None
+    comp_dict = {}
+    for t_label, ev_info in unique_tasks.items():
+        t_rel, r_data, _ = get_single_trial_signal(raw, ev_info["onset_sec"], ev_info["duration_sec"], channel)
+        f_data = None
+        if raw_filt:
+            _, f_data, _ = get_single_trial_signal(raw_filt, ev_info["onset_sec"], ev_info["duration_sec"], channel)
+        comp_dict[t_label] = {
+            "time": t_rel,
+            "raw_uv": r_data,
+            "filt_uv": f_data,
+            "event_code": ev_info["code"],
+            "is_synthetic": ev_info.get("is_synthetic", False)
+        }
+    return plot_segment_comparison_matplotlib(comp_dict, channel_name=channel)
+
+@st.cache_resource(show_spinner=False)
+def get_cached_montage_plot(file_path: str, run_id: int, seg_idx: int, apply_bp: bool, is_synthetic: bool = False):
+    """Caches multi-channel motor cortex montage Matplotlib plot."""
+    if is_synthetic:
+        raw, events = get_cached_synthetic_run()
+    else:
+        raw, events = get_cached_raw_and_events(file_path, run_id)
+    ev = events[seg_idx]
+    raw_sig = get_cached_preprocessed_raw(file_path, run_id, 8.0, 30.0, is_synthetic=is_synthetic) if apply_bp else raw
+    montage_chs = [ch for ch in CORE_CHANNELS if ch in raw.ch_names]
+    if not montage_chs:
+        return None
+    ch_dict = {}
+    t_rel = None
+    for ch in montage_chs:
+        t_rel, ch_s, _ = get_single_trial_signal(raw_sig, ev["onset_sec"], ev["duration_sec"], ch)
+        ch_dict[ch] = ch_s
+    return plot_multichannel_montage_matplotlib(
+        time_array=t_rel,
+        channels_data=ch_dict,
+        task_label=ev["label"],
+        event_code=ev["code"]
+    )
+
+@st.cache_data(show_spinner=False)
+def get_cached_trial_features_table(file_path: str, run_id: int, seg_idx: int, is_synthetic: bool = False):
+    """Caches single trial features table computation."""
+    if is_synthetic:
+        raw, events = get_cached_synthetic_run()
+    else:
+        raw, events = get_cached_raw_and_events(file_path, run_id)
+    ev = events[seg_idx]
+    raw_filt = get_cached_preprocessed_raw(file_path, run_id, 1.0, 35.0, is_synthetic=is_synthetic)
+    return extract_single_trial_features_table(raw_filt, ev["onset_sec"], ev["duration_sec"])
+
+@st.cache_data(show_spinner=False)
+def get_cached_trial_prediction(file_path: str, run_id: int, seg_idx: int, is_synthetic: bool = False):
+    """Caches single trial classification prediction."""
+    if is_synthetic:
+        raw, events = get_cached_synthetic_run()
+    else:
+        raw, events = get_cached_raw_and_events(file_path, run_id)
+    ev = events[seg_idx]
+    clf = get_cached_bci_classifier()
+    if clf is None:
+        return None
+    raw_filt = get_cached_preprocessed_raw(file_path, run_id, 1.0, 35.0, is_synthetic=is_synthetic)
+    raw_picked = raw_filt.copy().pick(MOTOR_CHANNELS)
+    sf = raw_picked.info['sfreq']
+    st_samp = int(round((ev["onset_sec"] + 0.5) * sf))
+    sp_samp = min(st_samp + int(round(3.0 * sf)), raw_picked.n_times)
+    data = raw_picked.get_data()[:, st_samp:sp_samp]
+    return clf.predict_trial_segment(data, sfreq=sf, channel_names=MOTOR_CHANNELS)
 
 if "trained_clf_system" not in st.session_state:
     st.session_state.trained_clf_system = get_cached_bci_classifier()
@@ -243,6 +381,7 @@ with st.sidebar:
     is_synthetic = (data_mode == "Synthetic Demo Mode (Simulated)")
     subject_id = 1
     selected_run_id = 4
+    active_file_path = ""
     raw_eeg = None
     labelled_events = []
     metadata = {}
@@ -285,26 +424,18 @@ with st.sidebar:
                 index=run_options.index(4) if 4 in run_options else 0
             )
 
-            # Load the selected recording
+            # Load the selected recording (cached)
             try:
-                raw_eeg, labelled_events = load_real_eeg_run(available_runs[selected_run_id], selected_run_id)
-                metadata = get_recording_metadata(
-                    raw=raw_eeg,
-                    run_id=selected_run_id,
-                    file_path=available_runs[selected_run_id],
-                    labelled_events=labelled_events
-                )
+                active_file_path = available_runs[selected_run_id]
+                raw_eeg, labelled_events = get_cached_raw_and_events(active_file_path, selected_run_id)
+                metadata = get_cached_recording_metadata(active_file_path, selected_run_id, is_synthetic=False)
             except Exception as e:
                 st.error(f"Error loading recording: {e}")
     else:
         st.warning("⚠️ Synthetic Demo Mode active (clearly labeled as simulated).")
-        raw_eeg, labelled_events = generate_synthetic_demo_run(duration_sec=90.0, random_seed=42)
-        metadata = get_recording_metadata(
-            raw=raw_eeg,
-            run_id=4,
-            file_path="SYNTHETIC_SIMULATED_DEMO_RUN.edf",
-            labelled_events=labelled_events
-        )
+        active_file_path = "SYNTHETIC_SIMULATED_DEMO_RUN.edf"
+        raw_eeg, labelled_events = get_cached_synthetic_run()
+        metadata = get_cached_recording_metadata(active_file_path, 4, is_synthetic=True)
 
     st.markdown("---")
     st.subheader("Sensor Channel & Filtering")
@@ -442,38 +573,15 @@ with tabs[1]:
             st.markdown(f"**Active Channel:** `{selected_ch}` | **Sample Rate:** `{raw_eeg.info['sfreq']} Hz`")
 
         selected_ev = labelled_events[selected_seg_idx]
-        onset = selected_ev["onset_sec"]
-        dur = selected_ev["duration_sec"]
-
-        t_raw, s_raw, sfreq = get_single_trial_signal(raw_eeg, onset, dur, selected_ch)
-
-        s_filt = None
-        if apply_bandpass:
-            raw_filt = preprocess_raw(
-                raw_eeg,
-                l_freq=8.0,
-                h_freq=30.0,
-                notch_freq=60.0 if apply_notch else None,
-                copy=True
-            )
-            _, s_filt, _ = get_single_trial_signal(raw_filt, onset, dur, selected_ch)
-
-        fig_matplotlib = plot_single_segment_matplotlib(
-            time_array=t_raw,
-            raw_uv=s_raw,
-            filtered_uv=s_filt,
-            channel_name=selected_ch,
-            task_label=selected_ev["label"],
-            event_code=selected_ev["code"],
-            is_synthetic=selected_ev.get("is_synthetic", False)
+        fig_matplotlib, p2p, rms, std_val = get_cached_single_segment_plot(
+            active_file_path, selected_run_id, selected_seg_idx, selected_ch, apply_bandpass, apply_notch, is_synthetic=is_synthetic
         )
         st.pyplot(fig_matplotlib, use_container_width=True)
-        plt.close(fig_matplotlib)
 
         col_st1, col_st2, col_st3, col_st4 = st.columns(4)
-        col_st1.metric("Peak-to-Peak Amplitude", f"{np.ptp(s_raw):.1f} μV")
-        col_st2.metric("RMS Signal Power", f"{np.sqrt(np.mean(s_raw**2)):.1f} μV")
-        col_st3.metric("Standard Deviation", f"{np.std(s_raw):.1f} μV")
+        col_st1.metric("Peak-to-Peak Amplitude", f"{p2p:.1f} μV")
+        col_st2.metric("RMS Signal Power", f"{rms:.1f} μV")
+        col_st3.metric("Standard Deviation", f"{std_val:.1f} μV")
         col_st4.metric("Dataset Event Code", f"{selected_ev['code']}")
 
 # =========================================================
@@ -481,7 +589,7 @@ with tabs[1]:
 # =========================================================
 with tabs[2]:
     st.subheader("3. Cross-Task Signal Comparison & Multi-Channel Montage")
-    st.markdown("""
+    st.markdown(r"""
     Compare the brain signals of different motor imagery tasks (**Rest**, **Left Fist**, **Right Fist**, **Both Feet**) 
     on the exact same amplitude ($\mu\text{V}$) scale to inspect physiological sensorimotor differences.
     """)
@@ -489,60 +597,15 @@ with tabs[2]:
     if raw_eeg is None:
         st.error("No EEG data available.")
     else:
-        unique_tasks = {}
-        for ev in labelled_events:
-            label = ev["label"]
-            if label not in unique_tasks:
-                unique_tasks[label] = ev
-
         st.markdown(f"#### Aligned Waveforms Comparison for Channel `{selected_ch}`")
-
-        comparison_dict = {}
-        raw_filt_comp = preprocess_raw(raw_eeg, l_freq=8.0, h_freq=30.0, copy=True) if apply_bandpass else None
-
-        for t_label, ev_info in unique_tasks.items():
-            t_rel, r_data, _ = get_single_trial_signal(raw_eeg, ev_info["onset_sec"], ev_info["duration_sec"], selected_ch)
-            f_data = None
-            if raw_filt_comp:
-                _, f_data, _ = get_single_trial_signal(raw_filt_comp, ev_info["onset_sec"], ev_info["duration_sec"], selected_ch)
-            
-            comparison_dict[t_label] = {
-                "time": t_rel,
-                "raw_uv": r_data,
-                "filt_uv": f_data,
-                "event_code": ev_info["code"],
-                "is_synthetic": ev_info.get("is_synthetic", False)
-            }
-
-        fig_comp = plot_segment_comparison_matplotlib(comparison_dict, channel_name=selected_ch)
+        fig_comp = get_cached_comparison_plot(active_file_path, selected_run_id, selected_ch, apply_bandpass, is_synthetic=is_synthetic)
         st.pyplot(fig_comp, use_container_width=True)
-        plt.close(fig_comp)
 
         st.markdown("---")
         st.markdown(f"#### Multi-Channel Motor Cortex Montage ($C_3, C_z, C_4$)")
-        
-        target_ev = labelled_events[selected_seg_idx]
-        montage_channels = [ch for ch in CORE_CHANNELS if ch in raw_eeg.ch_names]
-        
-        if montage_channels:
-            channels_dict = {}
-            for ch in montage_channels:
-                _, ch_sig, _ = get_single_trial_signal(
-                    raw_filt_comp if raw_filt_comp else raw_eeg,
-                    target_ev["onset_sec"],
-                    target_ev["duration_sec"],
-                    ch
-                )
-                channels_dict[ch] = ch_sig
-
-            fig_montage = plot_multichannel_montage_matplotlib(
-                time_array=t_raw,
-                channels_data=channels_dict,
-                task_label=target_ev["label"],
-                event_code=target_ev["code"]
-            )
+        fig_montage = get_cached_montage_plot(active_file_path, selected_run_id, selected_seg_idx, apply_bandpass, is_synthetic=is_synthetic)
+        if fig_montage is not None:
             st.pyplot(fig_montage, use_container_width=True)
-            plt.close(fig_montage)
 
 # =========================================================
 # SECTION 4: AI CLASSIFICATION (STEP 2 CORE SECTION)
@@ -766,7 +829,7 @@ with tabs[3]:
         t_dur = target_trial["duration_sec"]
 
         # 1. Waveform Preview
-        raw_filt_insp = preprocess_raw(raw_eeg, l_freq=1.0, h_freq=35.0, copy=True)
+        raw_filt_insp = get_cached_preprocessed_raw(active_file_path, selected_run_id, 1.0, 35.0, is_synthetic=is_synthetic)
         t_seg, s_raw_seg, sf = get_single_trial_signal(raw_eeg, t_onset, t_dur, inspect_ch)
         _, s_filt_seg, _ = get_single_trial_signal(raw_filt_insp, t_onset, t_dur, inspect_ch)
 
@@ -783,77 +846,66 @@ with tabs[3]:
         st.pyplot(fig_insp_wave, use_container_width=True)
         plt.close(fig_insp_wave)
 
-        # 2. Multi-Band Feature Extraction for this trial
-        # Extract features across all motor channels for this trial window
-        ep_single = create_epochs_from_events(raw_filt_insp, tmin=0.5, tmax=3.5, selected_channels=MOTOR_CHANNELS)
-        
-        if inspect_idx < len(ep_single):
-            single_trial_data = ep_single[inspect_idx].get_data() # (1, n_channels, n_times)
+        # 2. Multi-Band Feature Extraction for this trial (cached)
+        raw_picked_feat = raw_filt_insp.copy().pick(MOTOR_CHANNELS)
+        sf_feat = raw_picked_feat.info['sfreq']
+        st_samp = int(round((target_trial["onset_sec"] + 0.5) * sf_feat))
+        sp_samp = min(st_samp + int(round(3.0 * sf_feat)), raw_picked_feat.n_times)
+        single_trial_data = raw_picked_feat.get_data()[:, st_samp:sp_samp]
+
+        st.markdown(f"#### Extracted Multi-Band Features for Trial #{target_trial['index']}")
+        df_trial_features = extract_single_trial_features_table(
+            single_epoch_data=single_trial_data,
+            sfreq=sf_feat,
+            channel_names=MOTOR_CHANNELS
+        )
+
+        col_ft1, col_ft2 = st.columns([1, 1])
+        with col_ft1:
+            st.markdown("##### Channel-Wise Band Powers & Signal Statistics")
+            st.dataframe(df_trial_features.set_index("Channel"), height=250, use_container_width=True)
+
+        with col_ft2:
+            # Bar chart comparing Delta, Theta, Alpha, Beta across C3, Cz, C4
+            df_core = df_trial_features[df_trial_features["Channel"].isin(["C3", "Cz", "C4"])]
+            if len(df_core) > 0:
+                fig_band_bar = px.bar(
+                    df_core,
+                    x="Channel",
+                    y=["Delta (0.5–4Hz)", "Theta (4–8Hz)", "Alpha/Mu (8–12Hz)", "Beta (13–30Hz)"],
+                    barmode="group",
+                    title="Sensorimotor Band Powers (Log PSD)",
+                    template="plotly_dark",
+                    height=260
+                )
+                st.plotly_chart(fig_band_bar, use_container_width=True)
+
+        # 3. Model Prediction vs Actual Label
+        st.markdown("#### Classification Prediction vs Actual Label")
+        if st.session_state.trained_clf_system is not None:
+            clf_inst = st.session_state.trained_clf_system
             
-            st.markdown(f"#### Extracted Multi-Band Features for Trial #{target_trial['index']}")
-            df_trial_features = extract_single_trial_features_table(
-                single_epoch_data=single_trial_data,
-                sfreq=sf,
-                channel_names=MOTOR_CHANNELS
-            )
+            # Check for out-of-domain Rest trial on 2-class model
+            if len(clf_inst.classes_) == 2 and target_trial["code"] == "T0":
+                st.warning(f"⚠️ **Out-of-Domain Segment:** Trial #{target_trial['index']} is a **Rest baseline (T0)** segment. The active model was trained as a **2-Class classifier** (Left Fist vs Right Fist), so it cannot classify Rest. Please select a Left/Right motor imagery trial, or train a 3-Class model (Rest vs Left vs Right).")
+            
+            pred_res = get_cached_trial_prediction(active_file_path, selected_run_id, inspect_idx, is_synthetic=is_synthetic)
+            if pred_res is not None:
+                pred_c_id, pred_name, conf_score, all_probs = pred_res
+                actual_name = target_trial["label"]
+                mapped_cmd = st.session_state.communicator.map_class_to_command(pred_name)
 
-            col_ft1, col_ft2 = st.columns([1, 1])
-            with col_ft1:
-                st.markdown("##### Channel-Wise Band Powers & Signal Statistics")
-                st.dataframe(df_trial_features.set_index("Channel"), height=250, use_container_width=True)
+                col_pr1, col_pr2, col_pr3, col_pr4 = st.columns(4)
+                col_pr1.metric("Predicted Category", pred_name)
+                col_pr2.metric("Mapped BCI Command", mapped_cmd)
+                col_pr3.metric("Calibrated Confidence", f"{conf_score * 100:.1f}%")
+                col_pr4.metric("Actual Dataset Label", actual_name)
 
-            with col_ft2:
-                # Bar chart comparing Delta, Theta, Alpha, Beta across C3, Cz, C4
-                df_core = df_trial_features[df_trial_features["Channel"].isin(["C3", "Cz", "C4"])]
-                if len(df_core) > 0:
-                    fig_band_bar = px.bar(
-                        df_core,
-                        x="Channel",
-                        y=["Delta (0.5–4Hz)", "Theta (4–8Hz)", "Alpha/Mu (8–12Hz)", "Beta (13–30Hz)"],
-                        barmode="group",
-                        title="Sensorimotor Band Powers (Log PSD)",
-                        template="plotly_dark",
-                        height=260
-                    )
-                    st.plotly_chart(fig_band_bar, use_container_width=True)
-
-            # 3. Model Prediction vs Actual Label
-            st.markdown("#### Classification Prediction vs Actual Label")
-            if st.session_state.trained_clf_system is not None:
-                clf_inst = st.session_state.trained_clf_system
-                
-                # Check for out-of-domain Rest trial on 2-class model
-                if len(clf_inst.classes_) == 2 and target_trial["code"] == "T0":
-                    st.warning(f"⚠️ **Out-of-Domain Segment:** Trial #{target_trial['index']} is a **Rest baseline (T0)** segment. The active model was trained as a **2-Class classifier** (Left Fist vs Right Fist), so it cannot classify Rest. Please select a Left/Right motor imagery trial, or train a 3-Class model (Rest vs Left vs Right).")
-                
-                # Extract trial segment with exact sample alignment matching training
-                raw_filt_infer = preprocess_raw(raw_eeg, l_freq=1.0, h_freq=35.0, copy=True)
-                raw_picked_infer = raw_filt_infer.copy().pick(MOTOR_CHANNELS)
-                sf_infer = raw_picked_infer.info['sfreq']
-                start_samp = int((target_trial["onset_sec"] + 0.5) * sf_infer)
-                stop_samp = start_samp + int(3.0 * sf_infer)
-                
-                if stop_samp <= raw_picked_infer.n_times:
-                    trial_signal_data = raw_picked_infer.get_data()[:, start_samp:stop_samp]
-                    pred_c_id, pred_name, conf_score, all_probs = clf_inst.predict_trial_segment(
-                        trial_data=trial_signal_data,
-                        sfreq=sf_infer,
-                        channel_names=MOTOR_CHANNELS
-                    )
-                    actual_name = target_trial["label"]
-                    mapped_cmd = st.session_state.communicator.map_class_to_command(pred_name)
-
-                    col_pr1, col_pr2, col_pr3, col_pr4 = st.columns(4)
-                    col_pr1.metric("Predicted Category", pred_name)
-                    col_pr2.metric("Mapped BCI Command", mapped_cmd)
-                    col_pr3.metric("Calibrated Confidence", f"{conf_score * 100:.1f}%")
-                    col_pr4.metric("Actual Dataset Label", actual_name)
-
-                    # Honest comparison note
-                    if pred_name == actual_name:
-                        st.success(f"✅ Prediction matches dataset ground truth: **{pred_name}** → Mapped Command: **{mapped_cmd}**")
-                    else:
-                        st.info(f"ℹ️ Prediction: **{pred_name}** | Ground Truth: **{actual_name}** (Calibrated Confidence: {conf_score * 100:.1f}%)")
+                # Honest comparison note
+                if pred_name == actual_name:
+                    st.success(f"✅ Prediction matches dataset ground truth: **{pred_name}** → Mapped Command: **{mapped_cmd}**")
+                else:
+                    st.info(f"ℹ️ Prediction: **{pred_name}** | Ground Truth: **{actual_name}** (Calibrated Confidence: {conf_score * 100:.1f}%)")
             else:
                 st.info("Train a model above in Part A or click **Load Model** to run predictions.")
 
@@ -861,118 +913,29 @@ with tabs[3]:
 # SECTION 5: MIND-TO-TEXT SMART VIRTUAL BCI KEYBOARD
 # =========================================================
 with tabs[4]:
-    st.subheader("5. EEG-Based Smart Virtual BCI Keyboard & Speech Synthesis")
-    st.markdown("""
-    Type text using **classified EEG motor imagery states** or **interactive manual testing**.
-    Includes real-time cursor navigation, dictionary-based word suggestions, safety debouncing,
-    trial segment deduplication, and browser **Text-to-Speech (TTS)**.
-    """)
-
+    st.subheader("5. Mind-to-Text Communication System")
     kb = st.session_state.virtual_keyboard
 
-    # -----------------------------------------------------
-    # 1. Mode Selection: Manual Demo vs EEG Prediction Mode
-    # -----------------------------------------------------
-    col_mode_sel, col_mode_badge = st.columns([2, 1])
+    # 1. Mode Switcher (Clean, concise)
+    col_mode_sel, col_mode_badge = st.columns([3, 1])
     with col_mode_sel:
         active_mode = st.radio(
-            "Operating Mode",
-            options=["🟢 Manual Demo Mode (Interactive Click & Test)", "🧠 EEG Prediction Mode (Brain Signal Triggered)"],
+            "Interaction Mode",
+            options=["🟢 Manual Mode (Immediate Button Action)", "🧠 EEG Prediction Mode (Brain Signal Triggered)"],
             horizontal=True,
-            help="Choose whether keyboard actions are triggered manually or strictly by real EEG predictions."
+            help="Select Manual Mode for instant button testing or EEG Mode to dispatch brain-signal predictions."
         )
     is_eeg_mode = ("EEG Prediction Mode" in active_mode)
 
     with col_mode_badge:
         st.markdown("<div style='margin-top:24px;'></div>", unsafe_allow_html=True)
         if is_eeg_mode:
-            if is_synthetic:
-                st.markdown("<span class='provenance-synthetic'>MODE: SIMULATED EEG PREDICTION</span>", unsafe_allow_html=True)
-            else:
-                st.markdown("<span class='provenance-real'>MODE: REAL EEG BRAIN-TRIGGERED</span>", unsafe_allow_html=True)
+            provenance_tag = "SIMULATED EEG PREDICTION" if is_synthetic else "REAL EEG BRAIN-TRIGGERED"
+            st.markdown(f"<span class='badge-real'>{provenance_tag}</span>", unsafe_allow_html=True)
         else:
-            st.markdown("<span class='provenance-manual'>MODE: MANUAL DEMO (NO EEG CLAIM)</span>", unsafe_allow_html=True)
+            st.markdown("<span class='badge-real' style='background:#312e81; border-color:#4338ca;'>MANUAL ACTION MODE</span>", unsafe_allow_html=True)
 
-    # -----------------------------------------------------
-    # 2. Genuine Dataset Verification & Action Mapping Config
-    # -----------------------------------------------------
-    current_run_classes = metadata.get("classes", []) if metadata else []
-    with st.expander("⚙️ BCI Navigation Mode, Dataset Support & Action Mapping", expanded=False):
-        col_nav_strat, col_guards = st.columns([1, 1])
-        with col_nav_strat:
-            st.markdown("##### Navigation Speed & Strategy")
-            nav_choice = st.radio(
-                "BCI Navigation Strategy",
-                options=["⚡ Row-Column 2-Step Scanning (Much Faster BCI)", "🔄 Linear Sequential Scanning"],
-                horizontal=True,
-                index=0 if kb.nav_mode == "ROW_COLUMN" else 1,
-                help="Row-Column scanning lets you reach any letter in 2-4 steps instead of up to 30 steps."
-            )
-            kb.nav_mode = "ROW_COLUMN" if "Row-Column" in nav_choice else "LINEAR"
-
-            st.markdown("##### Genuine Dataset Support Check")
-            st.markdown(f"**Selected Recording:** `Run {selected_run_id}` ({metadata.get('run_name', 'Current')})")
-            st.markdown(f"**PhysioNet Event Classes in this Run:** `{current_run_classes}`")
-            if "Both Feet" not in str(current_run_classes) and "Both Fists" not in str(current_run_classes):
-                st.info("ℹ️ **Run Notice:** This recording contains **Left Fist**, **Right Fist**, and **Rest** events. Tasks like *Both Feet* or *Both Fists* occur in Runs 5, 6, 9, 10, 13, 14. Left/Right imagery drives cursor navigation.")
-            else:
-                st.success("✅ **Run Notice:** This recording contains multi-limb tasks suitable for full 4-class navigation and selection.")
-
-        with col_guards:
-            st.markdown("##### Safety Guards & Thresholds")
-            new_conf_thresh = st.slider(
-                "Confidence Threshold (Safety Gate)",
-                min_value=0.50, max_value=0.95,
-                value=float(kb.confidence_threshold),
-                step=0.05,
-                help="EEG predictions below this threshold will be blocked to avoid false typing."
-            )
-            kb.confidence_threshold = new_conf_thresh
-
-            new_cooldown = st.slider(
-                "Action Cooldown (Debounce)",
-                min_value=0.5, max_value=3.0,
-                value=float(kb.cooldown_seconds),
-                step=0.25,
-                help="Minimum seconds between accepted actions to prevent accidental repeated typing."
-            )
-            kb.cooldown_seconds = new_cooldown
-
-        st.markdown("---")
-        st.markdown("##### EEG Task to Keyboard Action Mapping")
-        action_opts = [
-            ACTION_MOVE_LEFT,
-            ACTION_MOVE_RIGHT,
-            ACTION_SELECT,
-            ACTION_SPACE,
-            ACTION_NEXT_ROW,
-            ACTION_NO_ACTION
-        ]
-        col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
-        with col_m1:
-            map_left = st.selectbox("Left Fist Imagery", options=action_opts, index=action_opts.index(kb.mapping.get("Left Fist Imagery", ACTION_MOVE_LEFT)))
-            kb.mapping["Left Fist Imagery"] = map_left
-            kb.mapping["Left Fist (Exec)"] = map_left
-        with col_m2:
-            map_right = st.selectbox("Right Fist Imagery", options=action_opts, index=action_opts.index(kb.mapping.get("Right Fist Imagery", ACTION_MOVE_RIGHT)))
-            kb.mapping["Right Fist Imagery"] = map_right
-            kb.mapping["Right Fist (Exec)"] = map_right
-        with col_m3:
-            map_fists = st.selectbox("Both Fists Imagery", options=action_opts, index=action_opts.index(kb.mapping.get("Both Fists Imagery", ACTION_SELECT)))
-            kb.mapping["Both Fists Imagery"] = map_fists
-            kb.mapping["Both Fists (Exec)"] = map_fists
-        with col_m4:
-            map_feet = st.selectbox("Both Feet Imagery", options=action_opts, index=action_opts.index(kb.mapping.get("Both Feet Imagery", ACTION_SPACE)))
-            kb.mapping["Both Feet Imagery"] = map_feet
-            kb.mapping["Both Feet (Exec)"] = map_feet
-        with col_m5:
-            map_rest = st.selectbox("Rest Baseline", options=action_opts, index=action_opts.index(kb.mapping.get("Rest", ACTION_NO_ACTION)))
-            kb.mapping["Rest"] = map_rest
-
-    # -----------------------------------------------------
-    # 3. Prominent Accumulated Text Output & Quick Phrases
-    # -----------------------------------------------------
-    st.markdown("#### Composed Sentence Output")
+    # 2. Large Composed Sentence Output Box
     text_val = kb.accumulated_text
     char_count = len(text_val)
     word_count = len(text_val.strip().split()) if text_val.strip() else 0
@@ -980,80 +943,91 @@ with tabs[4]:
     st.markdown(f"""
     <div class='keyboard-text-display'>
         <div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;'>
-            <span style='color:#94a3b8; font-size:0.8rem; font-weight:700; text-transform:uppercase;'>Composed Sentence Buffer</span>
+            <span style='color:#94a3b8; font-size:0.8rem; font-weight:700; text-transform:uppercase;'>Composed Sentence</span>
             <span style='color:#64748b; font-size:0.8rem;'>{word_count} words | {char_count} chars</span>
         </div>
         <div class='text-output-string'>
-            {text_val if text_val else "<span style='color:#475569;'>[Start typing via Virtual Keyboard, Quick Phrases, or EEG below...]</span>"}
+            {text_val if text_val else "<span style='color:#475569;'>[Start typing below...]</span>"}
         </div>
     </div>
     """, unsafe_allow_html=True)
 
-    # 3A. Quick Assistive Phrases Bar (Instant One-Touch Entry)
+    # Sentence Controls: Speak (TTS), Copy Text, Clear
+    col_sc1, col_sc2 = st.columns([3, 1])
+    with col_sc1:
+        tts_html = generate_tts_html(text_val if text_val.strip() else "Sentence is empty", autoplay=False)
+        components.html(tts_html, height=45)
+    with col_sc2:
+        if st.button("🗑️ Clear Text", use_container_width=True):
+            kb.clear(source="Manual Click" if not is_eeg_mode else "Manual Override")
+            st.rerun()
+
+    # 3. Direct Action Navigation Bar (Requirement 1: RIGHT, LEFT, SELECT, SPACE, DELETE)
+    st.markdown("<div style='margin-top:6px;'></div>", unsafe_allow_html=True)
+    st.markdown("##### Direct Keyboard Actions (Execute Immediately):")
+    col_d_left, col_d_right, col_d_sel, col_d_sp, col_d_del = st.columns(5)
+    
+    with col_d_left:
+        if st.button("⬅️ LEFT", use_container_width=True, key="btn_direct_left"):
+            kb.navigate_left()
+            st.rerun()
+    with col_d_right:
+        if st.button("➡️ RIGHT", use_container_width=True, key="btn_direct_right"):
+            kb.navigate_right()
+            st.rerun()
+    with col_d_sel:
+        sel_label = "↵ SELECT (Row)" if (kb.nav_mode == "ROW_COLUMN" and kb.nav_stage == "ROW") else f"↵ SELECT '{kb.current_key}'"
+        if st.button(sel_label, type="primary", use_container_width=True, key="btn_direct_select"):
+            kb.select_current_key(source="Manual Click" if not is_eeg_mode else "Manual Override")
+            st.rerun()
+    with col_d_sp:
+        if st.button("␣ SPACE", use_container_width=True, key="btn_direct_space"):
+            kb.type_letter_direct("SPACE", source="Manual Click" if not is_eeg_mode else "Manual Override")
+            st.rerun()
+    with col_d_del:
+        if st.button("⌫ DELETE", use_container_width=True, key="btn_direct_del"):
+            kb.backspace(source="Manual Click" if not is_eeg_mode else "Manual Override")
+            st.rerun()
+
+    # 4. Quick Phrases & Word Autocomplete
     st.markdown("<div style='margin-top:8px;'></div>", unsafe_allow_html=True)
-    st.markdown("<div style='font-size:0.85rem; font-weight:700; color:#38bdf8; margin-bottom:4px;'>⚡ Quick Assistive Phrases (One-Click Instant Entry):</div>", unsafe_allow_html=True)
+    st.markdown("<div style='font-size:0.85rem; font-weight:700; color:#38bdf8; margin-bottom:4px;'>⚡ Quick Assistive Phrases:</div>", unsafe_allow_html=True)
     phrase_cols = st.columns(len(QUICK_PHRASES))
     for p_idx, phrase in enumerate(QUICK_PHRASES):
         with phrase_cols[p_idx]:
             if st.button(f"💬 {phrase}", key=f"quick_phrase_{p_idx}", use_container_width=True):
-                src = "Manual Click" if not is_eeg_mode else ("Synthetic Demo" if is_synthetic else "Real EEG Assisted")
-                kb.apply_phrase(phrase, source=src)
+                kb.apply_phrase(phrase, source="Manual Click" if not is_eeg_mode else "Manual Override")
                 st.rerun()
 
-    # 3B. Word Prediction and Autocomplete (Top 3-5 Matches)
     suggestions = get_word_suggestions(text_val, max_suggestions=5)
-    st.markdown("<div style='margin-top:8px;'></div>", unsafe_allow_html=True)
-    col_sug_lbl, col_sug_btns = st.columns([1, 4])
-    with col_sug_lbl:
-        st.markdown("<div style='padding-top:6px; font-size:0.85rem; font-weight:700; color:#a78bfa;'>💡 Word Autocomplete:</div>", unsafe_allow_html=True)
-    with col_sug_btns:
-        cols_sug = st.columns(len(suggestions) if suggestions else 1)
-        if suggestions:
+    if suggestions:
+        st.markdown("<div style='margin-top:4px;'></div>", unsafe_allow_html=True)
+        col_sug_lbl, col_sug_btns = st.columns([1, 4])
+        with col_sug_lbl:
+            st.markdown("<div style='padding-top:6px; font-size:0.85rem; font-weight:700; color:#a78bfa;'>💡 Autocomplete:</div>", unsafe_allow_html=True)
+        with col_sug_btns:
+            cols_sug = st.columns(len(suggestions))
             for idx, sug_word in enumerate(suggestions):
                 with cols_sug[idx]:
                     if st.button(f"✨ {sug_word}", key=f"sug_btn_{idx}", use_container_width=True):
-                        source_label = "Manual Click" if not is_eeg_mode else ("Synthetic Demo" if is_synthetic else "Real EEG Assisted")
-                        kb.apply_word_suggestion(sug_word, source=source_label)
+                        kb.apply_word_suggestion(sug_word, source="Manual Click" if not is_eeg_mode else "Manual Override")
                         st.rerun()
-        else:
-            st.caption("No suggestions available.")
 
-    # 3C. Sentence Action Controls: Delete, Clear, Space, and Speak/Copy TTS
-    col_act1, col_act2, col_act3, col_act4 = st.columns([1, 1, 1.5, 3])
-    with col_act1:
-        if st.button("⌫ Delete", use_container_width=True):
-            kb.backspace(source="Manual Click" if not is_eeg_mode else "EEG Mode Manual")
-            st.rerun()
-    with col_act2:
-        if st.button("🗑️ Clear", use_container_width=True):
-            kb.clear(source="Manual Click" if not is_eeg_mode else "EEG Mode Manual")
-            st.rerun()
-    with col_act3:
-        if st.button("␣ Space", use_container_width=True):
-            kb.type_letter_direct("SPACE", source="Manual Click" if not is_eeg_mode else "EEG Mode Manual")
-            st.rerun()
-    with col_act4:
-        tts_html = generate_tts_html(text_val if text_val.strip() else "Buffer is empty", autoplay=False)
-        components.html(tts_html, height=45)
-
-    # -----------------------------------------------------
-    # 4. Interactive QWERTY Keyboard with Row-Column Guidance
-    # -----------------------------------------------------
+    # 5. Interactive Virtual Keyboard Grid
     st.markdown("---")
     if kb.nav_mode == "ROW_COLUMN":
         if kb.nav_stage == "ROW":
-            st.info(f"📍 **Navigation Stage 1 (Select Row):** Currently targeting **Row {kb.active_row_idx + 1}** (`{' '.join(KEYBOARD_ROWS[kb.active_row_idx])}`). Trigger **Select (↵)** or click a key to select this row, or **Left/Right** to scan rows.")
+            st.caption(f"📍 **Row Stage:** Targeting **Row {kb.active_row_idx + 1}** (`{' '.join(KEYBOARD_ROWS[kb.active_row_idx])}`). Click **SELECT** to enter row, or **LEFT/RIGHT** to change row.")
         else:
-            st.success(f"📍 **Navigation Stage 2 (Select Letter):** Inside **Row {kb.active_row_idx + 1}**, active cursor is on key `[ {kb.current_key} ]`. Trigger **Select (↵)** to type it!")
+            st.caption(f"📍 **Letter Stage:** Active key is `[ {kb.current_key} ]`. Click **SELECT** to type it, or **LEFT/RIGHT** to move.")
     else:
-        st.markdown(f"#### Interactive On-Screen QWERTY Keyboard (Active Cursor: `[ {kb.current_key} ]`)")
+        st.caption(f"📍 Active Selection: `[ {kb.current_key} ]`")
 
-    # Render QWERTY Keyboard Rows with Visual Highlighting
+    # Render QWERTY Rows
     for row_idx, row_keys in enumerate(KEYBOARD_ROWS):
         is_row_targeted = (kb.nav_mode == "ROW_COLUMN" and kb.active_row_idx == row_idx)
         key_cols = st.columns(len(row_keys))
         for k_idx, key in enumerate(row_keys):
-            # In Row-Column mode, highlight based on stage
             if kb.nav_mode == "ROW_COLUMN":
                 if kb.nav_stage == "ROW":
                     is_active = (is_row_targeted and k_idx == 0)
@@ -1065,7 +1039,6 @@ with tabs[4]:
             with key_cols[k_idx]:
                 btn_label = f"[{key}]" if is_active else key
                 btn_type = "primary" if is_active else "secondary"
-                
                 if st.button(btn_label, key=f"kb_key_{row_idx}_{k_idx}", type=btn_type, use_container_width=True):
                     if not is_eeg_mode:
                         if key in ["SPACE", "DELETE", "CLEAR"]:
@@ -1078,179 +1051,113 @@ with tabs[4]:
                         kb.set_highlighted_key(key)
                     st.rerun()
 
-    # Manual Navigation Pad for Demonstration in Manual Mode
-    if not is_eeg_mode:
-        st.markdown("<div style='margin-top:6px;'></div>", unsafe_allow_html=True)
-        col_nav_info, col_nl, col_nr, col_nsel, col_nbk = st.columns([2, 1, 1, 1, 1])
-        with col_nav_info:
-            nav_desc = "Row scanning" if (kb.nav_mode == "ROW_COLUMN" and kb.nav_stage == "ROW") else "Letter scanning"
-            st.caption(f"🎮 **Manual Navigation Demo ({nav_desc}):**")
-        with col_nl:
-            if st.button("← Previous", use_container_width=True):
-                kb.navigate_left()
-                st.rerun()
-        with col_nr:
-            if st.button("Next →", use_container_width=True):
-                kb.navigate_right()
-                st.rerun()
-        with col_nsel:
-            sel_btn_lbl = "↵ Select Row" if (kb.nav_mode == "ROW_COLUMN" and kb.nav_stage == "ROW") else "↵ Select Key"
-            if st.button(sel_btn_lbl, type="primary", use_container_width=True):
-                kb.select_current_key(source="Manual Click")
-                st.rerun()
-        with col_nbk:
-            if kb.nav_mode == "ROW_COLUMN" and kb.nav_stage == "COLUMN":
-                if st.button("↩️ Back to Rows", use_container_width=True):
-                    kb.cancel_to_row_stage()
-                    st.rerun()
-            else:
-                if st.button("↓ Next Row", use_container_width=True):
-                    kb.navigate_next_row()
-                    st.rerun()
-
-    # -----------------------------------------------------
-    # 5. EEG Prediction Mode: Brain Signal Ingestion & Dispatch
-    # -----------------------------------------------------
+    # 6. EEG Prediction Mode Controls (Clean, fast, non-blocking)
     if is_eeg_mode:
         st.markdown("---")
-        st.markdown("### 🧠 EEG Brain Signal Dispatcher (Real Data Only)")
-        st.caption("Select a real EEG segment, evaluate the calibrated AI model, and dispatch the predicted motor imagery action to the keyboard.")
-
+        st.markdown("### 🧠 EEG Brain Signal Prediction & Keyboard Dispatch")
+        
         if st.session_state.trained_clf_system is None:
-            st.warning("⚠️ No trained AI classifier loaded. Train one in **Tab 4 (AI Classification)** or click below to load the trained model:")
-            if st.button("📂 Load Saved Calibrated Model from Disk", type="primary"):
+            st.warning("⚠️ No trained AI classifier loaded.")
+            if st.button("📂 Load Trained Model from Disk", type="primary"):
                 loaded_clf = get_cached_bci_classifier()
                 if loaded_clf is not None:
                     st.session_state.trained_clf_system = loaded_clf
-                    st.session_state.class_names = loaded_clf.class_names_
                     st.success("Loaded model successfully!")
                     st.rerun()
-                else:
-                    st.error("No saved model found in models/ directory. Train one in Tab 4 first.")
         elif raw_eeg is None or len(labelled_events) == 0:
             st.error("No EEG recording is loaded. Please select a recording in the sidebar.")
         else:
-            clf_inst = st.session_state.trained_clf_system
-
-            # Select EEG trial
-            col_tr_sel1, col_tr_sel2 = st.columns([3, 1])
-            with col_tr_sel1:
+            col_eeg_sel, col_eeg_btn = st.columns([2, 1])
+            with col_eeg_sel:
                 eeg_trial_idx = st.selectbox(
                     "Select Genuine EEG Trial Segment",
                     options=range(len(labelled_events)),
-                    format_func=lambda i: f"Trial #{labelled_events[i]['index']}: {labelled_events[i]['label']} [{labelled_events[i]['code']}] (t={labelled_events[i]['onset_sec']:.2f}s, dur={labelled_events[i]['duration_sec']:.1f}s)",
+                    format_func=lambda i: f"Trial #{labelled_events[i]['index']}: {labelled_events[i]['label']} [{labelled_events[i]['code']}] (onset={labelled_events[i]['onset_sec']:.1f}s)",
                     key="eeg_kb_trial_select"
                 )
-            with col_tr_sel2:
+            with col_eeg_btn:
                 st.markdown("<div style='margin-top:28px;'></div>", unsafe_allow_html=True)
-                if st.button("⏭️ Next Trial", use_container_width=True):
-                    next_idx = (eeg_trial_idx + 1) % len(labelled_events)
-                    st.session_state.eeg_kb_trial_select = next_idx
-                    st.rerun()
+                col_nb1, col_nb2 = st.columns(2)
+                with col_nb1:
+                    if st.button("⏮️ Prev", use_container_width=True):
+                        st.session_state.eeg_kb_trial_select = (eeg_trial_idx - 1) % len(labelled_events)
+                        st.rerun()
+                with col_nb2:
+                    if st.button("Next ⏭️", use_container_width=True):
+                        st.session_state.eeg_kb_trial_select = (eeg_trial_idx + 1) % len(labelled_events)
+                        st.rerun()
 
             target_eeg_ev = labelled_events[eeg_trial_idx]
             seg_unique_id = f"R{selected_run_id}_T{target_eeg_ev['index']}_{target_eeg_ev['code']}_{target_eeg_ev['onset_sec']:.2f}"
 
-            # Fast cached signal slicing: Avoid re-filtering entire recording on every interaction
-            sig_cache_key = f"cached_filt_raw_r{selected_run_id}_{is_synthetic}"
-            if sig_cache_key not in st.session_state:
-                raw_filt_bci = preprocess_raw(raw_eeg, l_freq=1.0, h_freq=35.0, copy=True)
-                st.session_state[sig_cache_key] = raw_filt_bci.copy().pick(MOTOR_CHANNELS)
+            # Cached EEG Prediction (Instant, never re-filters raw signal)
+            pred_res = get_cached_trial_prediction(active_file_path, selected_run_id, eeg_trial_idx, is_synthetic=is_synthetic)
+            if pred_res is not None:
+                pred_c_id, pred_label, conf_score, probs = pred_res
+                resolved_action = kb.mapping.get(pred_label, ACTION_NO_ACTION)
+                action_desc = ACTION_DESCRIPTIONS.get(resolved_action, resolved_action)
 
-            raw_picked_bci = st.session_state[sig_cache_key]
-            sf_bci = raw_picked_bci.info['sfreq']
-            start_samp = int(round((target_eeg_ev["onset_sec"] + 0.5) * sf_bci))
-            stop_samp = start_samp + int(round(3.0 * sf_bci))
-            stop_samp = min(stop_samp, raw_picked_bci.n_times)
+                col_disp_btn, col_disp_status = st.columns([1, 2])
+                with col_disp_btn:
+                    dispatch_clicked = st.button("⚡ Dispatch EEG Action", type="primary", use_container_width=True)
+                with col_disp_status:
+                    st.markdown(f"**Predicted Brain State:** `{pred_label}` ➔ **Mapped Action:** `{action_desc}`")
 
-            trial_sig_data = raw_picked_bci.get_data()[:, start_samp:stop_samp]
+                if dispatch_clicked:
+                    res_entry = kb.process_eeg_prediction(
+                        predicted_class=pred_label,
+                        confidence=conf_score,
+                        segment_id=seg_unique_id,
+                        mapping=kb.mapping,
+                        actual_label=target_eeg_ev["label"],
+                        is_synthetic=is_synthetic
+                    )
+                    if res_entry["status"] == "EXECUTED":
+                        st.toast(f"✅ EEG Action Executed: {res_entry['detail']}", icon="🧠")
+                        st.success(f"**Dispatched Action:** `{res_entry['action']}` — {res_entry['detail']}")
+                        st.rerun()
+                    elif res_entry["status"] == "DUPLICATE_IGNORED":
+                        st.warning("⚠️ Segment was already processed. Click 'Next ⏭️' to advance to the next EEG trial.")
+                    elif res_entry["status"] == "LOW_CONFIDENCE_IGNORED":
+                        st.info("ℹ️ Confidence below safety threshold.")
+                    elif res_entry["status"] == "COOLDOWN_IGNORED":
+                        st.info("ℹ️ Action cooldown active. Please retry in a moment.")
 
-            # Model prediction on genuine segment
-            pred_id, pred_label, conf_score, probs = clf_inst.predict_trial_segment(
-                trial_data=trial_sig_data,
-                sfreq=sf_bci,
-                channel_names=MOTOR_CHANNELS
+    # 7. Advanced Diagnostics & Debug View (Collapsible, kept out of normal UI)
+    with st.expander("🛠️ Advanced BCI Diagnostics & Debug View", expanded=False):
+        st.markdown("##### Navigation Strategy & Safety Thresholds")
+        col_dbg_s1, col_dbg_s2 = st.columns(2)
+        with col_dbg_s1:
+            nav_choice = st.radio(
+                "BCI Navigation Strategy",
+                options=["⚡ Row-Column 2-Step Scanning (Much Faster BCI)", "🔄 Linear Sequential Scanning"],
+                horizontal=True,
+                index=0 if kb.nav_mode == "ROW_COLUMN" else 1
             )
+            kb.nav_mode = "ROW_COLUMN" if "Row-Column" in nav_choice else "LINEAR"
+        with col_dbg_s2:
+            kb.confidence_threshold = st.slider("Confidence Gate", 0.50, 0.95, float(kb.confidence_threshold), 0.05)
+            kb.cooldown_seconds = st.slider("Debounce Cooldown (s)", 0.0, 2.0, float(kb.cooldown_seconds), 0.1)
 
-            resolved_action = kb.mapping.get(pred_label, ACTION_NO_ACTION)
-            action_desc = ACTION_DESCRIPTIONS.get(resolved_action, resolved_action)
+        st.markdown("##### EEG Task to Keyboard Action Mapping")
+        action_opts = [ACTION_MOVE_LEFT, ACTION_MOVE_RIGHT, ACTION_SELECT, ACTION_SPACE, ACTION_NEXT_ROW, ACTION_NO_ACTION]
+        col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
+        with col_m1:
+            kb.mapping["Left Fist Imagery"] = st.selectbox("Left Fist", action_opts, index=action_opts.index(kb.mapping.get("Left Fist Imagery", ACTION_MOVE_LEFT)))
+        with col_m2:
+            kb.mapping["Right Fist Imagery"] = st.selectbox("Right Fist", action_opts, index=action_opts.index(kb.mapping.get("Right Fist Imagery", ACTION_MOVE_RIGHT)))
+        with col_m3:
+            kb.mapping["Both Fists Imagery"] = st.selectbox("Both Fists", action_opts, index=action_opts.index(kb.mapping.get("Both Fists Imagery", ACTION_SELECT)))
+        with col_m4:
+            kb.mapping["Both Feet Imagery"] = st.selectbox("Both Feet", action_opts, index=action_opts.index(kb.mapping.get("Both Feet Imagery", ACTION_SPACE)))
+        with col_m5:
+            kb.mapping["Rest"] = st.selectbox("Rest Baseline", action_opts, index=action_opts.index(kb.mapping.get("Rest", ACTION_NO_ACTION)))
 
-            # Trial Waveform & Prediction Status Display
-            col_prev_wave, col_prev_meta = st.columns([1, 1])
-            with col_prev_wave:
-                st.markdown(f"**EEG Waveform Segment (Channel C3, t={target_eeg_ev['onset_sec']:.2f}s):**")
-                t_plot, s_plot, _ = get_single_trial_signal(raw_picked_bci, target_eeg_ev["onset_sec"], target_eeg_ev["duration_sec"], "C3")
-                fig_mini_wave = plot_single_segment_matplotlib(
-                    time_array=t_plot,
-                    raw_uv=s_plot,
-                    filtered_uv=None,
-                    channel_name="C3",
-                    task_label=target_eeg_ev["label"],
-                    event_code=target_eeg_ev["code"],
-                    is_synthetic=target_eeg_ev.get("is_synthetic", False),
-                    figsize=(8, 2.5)
-                )
-                st.pyplot(fig_mini_wave, use_container_width=True)
-                plt.close(fig_mini_wave)
-
-            with col_prev_meta:
-                st.markdown("**Genuine EEG Segment & Model Prediction Analysis:**")
-                
-                col_mp1, col_mp2 = st.columns(2)
-                col_mp1.metric("Actual Dataset Label", f"{target_eeg_ev['label']} [{target_eeg_ev['code']}]")
-                col_mp2.metric("Model Predicted Class", pred_label)
-
-                col_mp3, col_mp4 = st.columns(2)
-                col_mp3.metric("Calibrated Confidence", f"{conf_score * 100:.1f}%")
-                col_mp4.metric("Triggered Keyboard Action", action_desc)
-
-                # Deduplication and Safety Check Alert
-                is_duplicate = (seg_unique_id == kb.last_processed_segment_id)
-                meets_threshold = (conf_score >= kb.confidence_threshold)
-                
-                if is_duplicate:
-                    st.warning("⚠️ **Deduplication Guard:** This trial segment was already processed. Advance to next trial to avoid duplicate action.")
-                elif not meets_threshold:
-                    st.info(f"ℹ️ **Confidence Guard:** Confidence ({conf_score*100:.1f}%) is below your threshold ({kb.confidence_threshold*100:.1f}%).")
-                else:
-                    st.success("🟢 **Safety Check Passed:** Trial segment is fresh and confidence exceeds threshold.")
-
-            # Dispatch Trigger Button
-            col_disp_btn, col_disp_info = st.columns([1, 2])
-            with col_disp_btn:
-                dispatch_clicked = st.button("⚡ Dispatch EEG Prediction to Keyboard", type="primary", use_container_width=True)
-
-            if dispatch_clicked:
-                res_entry = kb.process_eeg_prediction(
-                    predicted_class=pred_label,
-                    confidence=conf_score,
-                    segment_id=seg_unique_id,
-                    mapping=kb.mapping,
-                    actual_label=target_eeg_ev["label"],
-                    is_synthetic=is_synthetic
-                )
-
-                if res_entry["status"] == "EXECUTED":
-                    st.toast(f"✅ Action Executed: {res_entry['detail']}", icon="🧠")
-                    st.success(f"**Dispatched Action:** `{res_entry['action']}` — {res_entry['detail']}. Text: **\"{kb.accumulated_text}\"**")
-                    st.rerun()
-                elif res_entry["status"] == "DUPLICATE_IGNORED":
-                    st.error(f"🛑 Duplicate Blocked: {res_entry['detail']}")
-                elif res_entry["status"] == "LOW_CONFIDENCE_IGNORED":
-                    st.warning(f"🛑 Confidence Blocked: {res_entry['detail']}")
-                elif res_entry["status"] == "COOLDOWN_IGNORED":
-                    st.warning(f"🛑 Cooldown Blocked: {res_entry['detail']}")
-
-    # -----------------------------------------------------
-    # 6. Action Audit Log & Session History
-    # -----------------------------------------------------
-    st.markdown("---")
-    st.markdown("#### Session Action History & Provenance Log")
-    if kb.action_history:
-        df_kb_hist = pd.DataFrame(kb.action_history)
-        st.dataframe(df_kb_hist, use_container_width=True)
-        if st.button("Clear Keyboard Audit Log"):
-            kb.action_history.clear()
-            st.rerun()
-    else:
-        st.info("No actions logged yet in this session.")
+        st.markdown("##### Session Action History & Provenance Audit Log")
+        if kb.action_history:
+            st.dataframe(pd.DataFrame(kb.action_history), use_container_width=True)
+            if st.button("Clear Audit Log"):
+                kb.action_history.clear()
+                st.rerun()
+        else:
+            st.caption("No keyboard actions recorded yet in this session.")

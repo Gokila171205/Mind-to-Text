@@ -44,7 +44,7 @@ _cached_runs: Dict[int, object] = {}
 _cached_events: Dict[int, List[Dict]] = {}
 _cached_classifier: Optional[EEGClassifierSystem] = None
 _communicator = MindToTextSystem()
-_virtual_keyboard = VirtualBCIKeyboard(confidence_threshold=0.60, cooldown_seconds=1.0)
+_virtual_keyboard = VirtualBCIKeyboard(confidence_threshold=0.60, cooldown_seconds=0.2)
 
 
 def _get_run(run_id: int):
